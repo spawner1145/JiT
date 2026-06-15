@@ -53,8 +53,8 @@ Check this [issue](https://github.com/conda/conda/issues/13812#issuecomment-2071
 ### Training
 The below training scripts have been tested on 8 H200 GPUs.
 
-By default, JiT logs training loss, learning rate, FID, and IS to TensorBoard under `--output_dir`. To also log them to
-Weights & Biases on the main process, add `--wandb --wandb_project ${WANDB_PROJECT}` and optionally
+By default, JiT logs training loss, learning rate, FID, and IS to TensorBoard under `--output_dir`. The examples below
+also enable Weights & Biases on the main process with `--wandb --wandb_project JiT`; optionally add
 `--wandb_run_name ${RUN_NAME}`. Gradient clipping uses global norm clipping with `--grad_clip 1.0` by default; set
 `--grad_clip 0.0` to disable clipping. Pre-clip gradient norm, post-clip gradient norm, and clip ratio are logged to
 TensorBoard and W&B.
@@ -78,6 +78,7 @@ main_jit.py \
 --epochs 600 --warmup_epochs 5 \
 --gen_bsz 128 --num_images 50000 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
@@ -95,6 +96,7 @@ main_jit.py \
 --epochs 600 --warmup_epochs 5 \
 --gen_bsz 128 --num_images 50000 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
@@ -110,6 +112,7 @@ main_jit.py \
 --epochs 600 --warmup_epochs 5 \
 --gen_bsz 128 --num_images 50000 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
@@ -127,6 +130,7 @@ main_jit.py \
 --epochs 600 --warmup_epochs 5 \
 --gen_bsz 128 --num_images 50000 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
@@ -142,6 +146,7 @@ main_jit.py \
 --epochs 600 --warmup_epochs 5 \
 --gen_bsz 128 --num_images 50000 --cfg 2.2 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
@@ -159,6 +164,7 @@ main_jit.py \
 --epochs 600 --warmup_epochs 5 \
 --gen_bsz 128 --num_images 50000 --cfg 2.2 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
@@ -190,6 +196,7 @@ main_jit.py \
 --img_size 256 (or 512) --noise_scale 1.0 (or 2.0) \
 --gen_bsz 256 --num_images 50000 --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -204,6 +211,7 @@ main_jit.py \
 --img_size 256 --noise_scale 1.0 \
 --gen_bsz 256 --num_images 50000 --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -218,6 +226,7 @@ main_jit.py \
 --img_size 512 --noise_scale 1.0 \
 --gen_bsz 256 --num_images 50000 --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -229,6 +238,7 @@ main_jit.py \
 --img_size 256 (or 512) --noise_scale 1.0 (or 2.0) \
 --gen_bsz 256 --num_images 50000 --cfg 2.4 (or 2.5) --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -243,6 +253,7 @@ main_jit.py \
 --img_size 256 --noise_scale 1.0 \
 --gen_bsz 256 --num_images 50000 --cfg 2.4 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -257,6 +268,7 @@ main_jit.py \
 --img_size 512 --noise_scale 1.0 \
 --gen_bsz 256 --num_images 50000 --cfg 2.5 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -268,6 +280,7 @@ main_jit.py \
 --img_size 256 (or 512) --noise_scale 1.0 (or 2.0) \
 --gen_bsz 256 --num_images 50000 --cfg 2.2 (or 2.3) --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -282,6 +295,7 @@ main_jit.py \
 --img_size 256 --noise_scale 1.0 \
 --gen_bsz 256 --num_images 50000 --cfg 2.2 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
@@ -296,6 +310,7 @@ main_jit.py \
 --img_size 512 --noise_scale 1.0 \
 --gen_bsz 256 --num_images 50000 --cfg 2.3 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--wandb --wandb_project JiT \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
