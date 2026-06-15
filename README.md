@@ -50,6 +50,25 @@ pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 ```
 Check this [issue](https://github.com/conda/conda/issues/13812#issuecomment-2071445372) for more details.
 
+### Preparing ModelScope ImageNet parquet
+
+JiT reads ImageNet through `torchvision.datasets.ImageFolder` at `<data_path>/train`, so a parquet copy of ImageNet
+must first be expanded to the standard synset-folder layout. If your ModelScope download contains parquet shards with
+`image` and `label` columns plus the ImageNet `classes.py` file, convert it with:
+```
+python tools/convert_imagenet_parquet_to_imagefolder.py \
+--parquet_dir ${MODELSCOPE_IMAGENET_PARQUET_DIR} \
+--classes_py ${MODELSCOPE_IMAGENET_CLASSES_PY} \
+--output_dir ${IMAGENET_PATH} \
+--output_split train \
+--parquet_glob "*.parquet"
+```
+
+The output will be written as `${IMAGENET_PATH}/train/n01440764/...`, `${IMAGENET_PATH}/train/n01443537/...`, and so
+on, which can be passed directly to the training commands below with `--data_path ${IMAGENET_PATH}`. If one directory
+contains multiple splits, restrict the input shards, for example with `--parquet_glob "train*.parquet"`. For a quick
+smoke test, add `--limit 100 --overwrite`; for an interrupted full conversion, rerun with `--resume`.
+
 ### Training
 The below training scripts have been tested on 8 H200 GPUs.
 
