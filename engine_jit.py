@@ -13,7 +13,19 @@ import torch_fidelity
 import copy
 
 
-def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+def get_grad_norm(parameters):
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if len(grads) == 0:
+        return torch.tensor(0.0)
+    device = grads[0].device
+    norms = torch.stack([torch.norm(g.float(), p=2).to(device) for g in grads])
+    return torch.norm(norms, p=2)
+
+
+def train_one_epoch(
+    model, model_without_ddp, data_loader, optimizer, device, epoch,
+    log_writer=None, wandb_run=None, args=None, data_space=None
+):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -32,6 +44,8 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         # normalize image to [-1, 1]
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
         x = x * 2.0 - 1.0
+        if data_space is not None:
+            x = data_space.encode(x)
         labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -44,6 +58,13 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         optimizer.zero_grad()
         loss.backward()
+        grad_norm_pre_clip = get_grad_norm(model.parameters())
+        grad_norm_post_clip = grad_norm_pre_clip
+        grad_clip_ratio = torch.tensor(0.0, device=grad_norm_pre_clip.device)
+        if args.grad_clip is not None and args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm_post_clip = get_grad_norm(model.parameters())
+            grad_clip_ratio = grad_norm_pre_clip / args.grad_clip
         optimizer.step()
 
         torch.cuda.synchronize()
@@ -51,20 +72,38 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         model_without_ddp.update_ema()
 
         metric_logger.update(loss=loss_value)
+        metric_logger.update(grad_norm=grad_norm_pre_clip.item())
+        metric_logger.update(grad_norm_post_clip=grad_norm_post_clip.item())
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
-        if log_writer is not None:
-            # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            if data_iter_step % args.log_freq == 0:
+        # Use epoch_1000x as the x-axis in TensorBoard/W&B to calibrate curves.
+        epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+        if data_iter_step % args.log_freq == 0:
+            if log_writer is not None:
                 log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
                 log_writer.add_scalar('lr', lr, epoch_1000x)
+                log_writer.add_scalar('grad_norm', grad_norm_pre_clip.item(), epoch_1000x)
+                log_writer.add_scalar('grad_norm_pre_clip', grad_norm_pre_clip.item(), epoch_1000x)
+                log_writer.add_scalar('grad_norm_post_clip', grad_norm_post_clip.item(), epoch_1000x)
+                log_writer.add_scalar('grad_clip_ratio', grad_clip_ratio.item(), epoch_1000x)
+
+            if wandb_run is not None:
+                log_data = {
+                    "train/loss": loss_value_reduce,
+                    "train/lr": lr,
+                    "train/epoch": data_iter_step / len(data_loader) + epoch,
+                    "train/grad_norm": grad_norm_pre_clip.item(),
+                    "train/grad_norm_pre_clip": grad_norm_pre_clip.item(),
+                    "train/grad_norm_post_clip": grad_norm_post_clip.item(),
+                    "train/grad_clip_ratio": grad_clip_ratio.item(),
+                }
+                wandb_run.log(log_data, step=epoch_1000x)
 
 
-def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
+def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, wandb_run=None, data_space=None):
 
     model_without_ddp.eval()
     world_size = misc.get_world_size()
@@ -109,6 +148,9 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             sampled_images = model_without_ddp.generate(labels_gen)
 
+        if data_space is not None:
+            sampled_images = data_space.decode(sampled_images)
+
         torch.distributed.barrier()
 
         # denormalize images
@@ -131,7 +173,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     model_without_ddp.load_state_dict(model_state_dict)
 
     # compute FID and IS
-    if log_writer is not None:
+    if log_writer is not None or wandb_run is not None:
         if args.img_size == 256:
             fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
         elif args.img_size == 512:
@@ -152,8 +194,20 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         fid = metrics_dict['frechet_inception_distance']
         inception_score = metrics_dict['inception_score_mean']
         postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
-        log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-        log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
+        if log_writer is not None:
+            log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
+            log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "eval/fid": fid,
+                    "eval/inception_score": inception_score,
+                    "eval/cfg": model_without_ddp.cfg_scale,
+                    "eval/img_size": args.img_size,
+                    "eval/epoch": epoch,
+                },
+                step=int((epoch + 1) * 1000),
+            )
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
         shutil.rmtree(save_folder)
 

@@ -17,4 +17,11 @@ dependencies:
     - scipy==1.9.1
     - einops==0.8.1
     - gdown==5.2.0
+    - filelock
+    - httpx<1.0.0
+    - huggingface-hub>=0.34.0,<2.0
+    - regex!=2019.12.17
+    - requests
+    - safetensors>=0.8.0rc0
+    - wandb>=0.16.0
     - -e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity

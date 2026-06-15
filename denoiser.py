@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model_jit import JiT_models
+from model_jit import create_jit_model
 
 
 class Denoiser(nn.Module):
@@ -9,14 +9,24 @@ class Denoiser(nn.Module):
         args
     ):
         super().__init__()
-        self.net = JiT_models[args.model](
-            input_size=args.img_size,
-            in_channels=3,
+        self.data_size = getattr(args, "data_size", args.img_size)
+        self.data_channels = getattr(args, "data_channels", 3)
+
+        self.net = create_jit_model(
+            args.model,
+            input_size=self.data_size,
+            in_channels=self.data_channels,
             num_classes=args.class_num,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
         )
-        self.img_size = args.img_size
+        if self.data_size % self.net.patch_size != 0:
+            raise ValueError(
+                f"Model patch size {self.net.patch_size} must divide data-space size {self.data_size}. "
+                f"For Flux2 VAE latents at --img_size 256, use a model like JiT-B/1."
+            )
+
+        self.img_size = self.data_size
         self.num_classes = args.class_num
 
         self.label_drop_prob = args.label_drop_prob
@@ -68,7 +78,9 @@ class Denoiser(nn.Module):
     def generate(self, labels):
         device = labels.device
         bsz = labels.size(0)
-        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
+        z = self.noise_scale * torch.randn(
+            bsz, self.data_channels, self.img_size, self.img_size, device=device
+        )
         timesteps = torch.linspace(0.0, 1.0, self.steps+1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
 
         if self.method == "euler":

@@ -18,6 +18,7 @@ import copy
 from engine_jit import train_one_epoch, evaluate
 
 from denoiser import Denoiser
+from latent_space import create_data_space
 
 
 def get_args_parser():
@@ -46,6 +47,8 @@ def get_args_parser():
                         help='Learning rate schedule')
     parser.add_argument('--weight_decay', type=float, default=0.0,
                         help='Weight decay (default: 0.0)')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='Clip gradient norm if > 0. Set to 0 to disable gradient clipping')
     parser.add_argument('--ema_decay1', type=float, default=0.9999,
                         help='The first ema to track. Use the first ema for sampling by default.')
     parser.add_argument('--ema_decay2', type=float, default=0.9996,
@@ -55,6 +58,29 @@ def get_args_parser():
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
+
+    # data space
+    parser.add_argument('--data_space', default='pixel', choices=['pixel', 'flux2vae'],
+                        help='Train/sample in pixel space or Flux2 VAE latent space')
+    parser.add_argument('--flux2_vae_path', '--flux2_vae', dest='flux2_vae_path',
+                        default='black-forest-labs/FLUX.2-klein-base-9B',
+                        help='Flux2 model repo/path that contains the VAE')
+    parser.add_argument('--flux2_vae_subfolder', default='vae',
+                        help='Subfolder containing the Flux2 VAE weights')
+    parser.add_argument('--flux2_vae_dtype', default='auto',
+                        choices=['auto', 'float32', 'float16', 'bfloat16'],
+                        help='dtype used to run the frozen Flux2 VAE')
+    parser.add_argument('--flux2_vae_sample_mode', default='argmax', choices=['argmax', 'sample'],
+                        help='Use the VAE posterior mode or a sampled latent when encoding training images')
+    parser.add_argument('--flux2_vae_patchify', action='store_true',
+                        help='Use Flux2/Klein 2x2 latent patchification and BN normalization')
+    parser.add_argument('--no_flux2_vae_patchify', action='store_false', dest='flux2_vae_patchify',
+                        help='Use raw 32-channel Flux2 VAE latents instead of Klein-style patchified latents')
+    parser.set_defaults(flux2_vae_patchify=True)
+    parser.add_argument('--flux2_vae_tiling', action='store_true',
+                        help='Enable VAE tiling for lower memory encoding/decoding')
+    parser.add_argument('--flux2_vae_slicing', action='store_true',
+                        help='Enable VAE slicing for lower memory encoding/decoding')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -98,6 +124,20 @@ def get_args_parser():
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--log_freq', default=100, type=int)
+    parser.add_argument('--wandb', action='store_true',
+                        help='Log training and evaluation metrics to Weights & Biases on the main process')
+    parser.add_argument('--wandb_project', default='JiT', type=str,
+                        help='Weights & Biases project name')
+    parser.add_argument('--wandb_entity', default=None, type=str,
+                        help='Weights & Biases entity name')
+    parser.add_argument('--wandb_run_name', default=None, type=str,
+                        help='Weights & Biases run name')
+    parser.add_argument('--wandb_group', default=None, type=str,
+                        help='Weights & Biases group name')
+    parser.add_argument('--wandb_tags', default='', type=str,
+                        help='Comma-separated Weights & Biases tags')
+    parser.add_argument('--wandb_mode', default=None, choices=['online', 'offline', 'disabled'],
+                        help='Weights & Biases mode')
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
 
@@ -125,6 +165,11 @@ def main(args):
     np.random.seed(seed)
 
     cudnn.benchmark = True
+
+    data_space = create_data_space(args, device)
+    args.data_channels = data_space.channels
+    args.data_size = data_space.size
+    print("Data space =", data_space)
 
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
@@ -179,6 +224,29 @@ def main(args):
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
 
+    wandb_run = None
+    if global_rank == 0 and args.wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise ImportError("Install wandb or disable --wandb to continue.") from exc
+
+        wandb_config = vars(args).copy()
+        wandb_config["effective_batch_size"] = eff_batch_size
+        wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+        wandb_kwargs = {
+            "project": args.wandb_project,
+            "entity": args.wandb_entity,
+            "name": args.wandb_run_name,
+            "group": args.wandb_group,
+            "tags": wandb_tags or None,
+            "config": wandb_config,
+            "dir": args.output_dir,
+        }
+        if args.wandb_mode is not None:
+            wandb_kwargs["mode"] = args.wandb_mode
+        wandb_run = wandb.init(**wandb_kwargs)
+
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
     model_without_ddp = model.module
 
@@ -215,7 +283,12 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(
+                    model_without_ddp, args, 0, batch_size=args.gen_bsz,
+                    log_writer=log_writer, wandb_run=wandb_run, data_space=data_space
+                )
+        if wandb_run is not None:
+            wandb_run.finish()
         return
 
     # Training loop
@@ -225,7 +298,10 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        train_one_epoch(
+            model, model_without_ddp, data_loader_train, optimizer, device, epoch,
+            log_writer=log_writer, wandb_run=wandb_run, args=args, data_space=data_space
+        )
 
         # Save checkpoint periodically
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
@@ -249,7 +325,10 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(
+                    model_without_ddp, args, epoch, batch_size=args.gen_bsz,
+                    log_writer=log_writer, wandb_run=wandb_run, data_space=data_space
+                )
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
@@ -258,6 +337,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time:', total_time_str)
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == '__main__':

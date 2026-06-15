@@ -384,6 +384,36 @@ def JiT_H_32(**kwargs):
                bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32, **kwargs)
 
 
+_JIT_ARCH_CONFIGS = {
+    'B': dict(depth=12, hidden_size=768, num_heads=12,
+              bottleneck_dim=128, in_context_len=32, in_context_start=4),
+    'L': dict(depth=24, hidden_size=1024, num_heads=16,
+              bottleneck_dim=128, in_context_len=32, in_context_start=8),
+    'H': dict(depth=32, hidden_size=1280, num_heads=16,
+              bottleneck_dim=256, in_context_len=32, in_context_start=10),
+}
+
+
+def create_jit_model(name, **kwargs):
+    if name in JiT_models:
+        return JiT_models[name](**kwargs)
+
+    try:
+        arch_name, patch_size = name.removeprefix('JiT-').split('/')
+        patch_size = int(patch_size)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unknown JiT model '{name}'. Expected names like 'JiT-B/16' or 'JiT-B/1'."
+        ) from exc
+
+    if arch_name not in _JIT_ARCH_CONFIGS:
+        raise ValueError(f"Unknown JiT architecture '{arch_name}'. Expected one of {sorted(_JIT_ARCH_CONFIGS)}.")
+    if patch_size <= 0:
+        raise ValueError(f"Patch size must be positive, got {patch_size}.")
+
+    return JiT(patch_size=patch_size, **_JIT_ARCH_CONFIGS[arch_name], **kwargs)
+
+
 JiT_models = {
     'JiT-B/16': JiT_B_16,
     'JiT-B/32': JiT_B_32,

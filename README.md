@@ -53,11 +53,41 @@ Check this [issue](https://github.com/conda/conda/issues/13812#issuecomment-2071
 ### Training
 The below training scripts have been tested on 8 H200 GPUs.
 
+By default, JiT logs training loss, learning rate, FID, and IS to TensorBoard under `--output_dir`. To also log them to
+Weights & Biases on the main process, add `--wandb --wandb_project ${WANDB_PROJECT}` and optionally
+`--wandb_run_name ${RUN_NAME}`. Gradient clipping uses global norm clipping with `--grad_clip 1.0` by default; set
+`--grad_clip 0.0` to disable clipping. Pre-clip gradient norm, post-clip gradient norm, and clip ratio are logged to
+TensorBoard and W&B.
+
+For token-matched Flux2 VAE latent-space ablations, keep the same `--img_size` as the pixel-space run and reduce the
+JiT patch size by the Flux2/Klein latent downsampling factor of 16. For example, pixel-space `JiT-B/16` at 256x256
+has a 16x16 image-token grid, and the matching latent-space model is `JiT-B/1`; pixel-space `JiT-B/32` at 512x512
+also has a 16x16 image-token grid, and the matching latent-space model is `JiT-B/2`. The default latent mode uses
+Flux2/Klein 2x2 patchified VAE latents with 128 channels. The latent-space commands below use `--noise_scale 1.0`
+for the BN-normalized Flux2 VAE latent space.
+
 Example script for training JiT-B/16 on ImageNet 256x256 for 600 epochs:
 ```
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
 main_jit.py \
 --model JiT-B/16 \
+--proj_dropout 0.0 \
+--P_mean -0.8 --P_std 0.8 \
+--img_size 256 --noise_scale 1.0 \
+--batch_size 128 --blr 5e-5 \
+--epochs 600 --warmup_epochs 5 \
+--gen_bsz 128 --num_images 50000 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--data_path ${IMAGENET_PATH} --online_eval
+```
+
+Token-matched Flux2 VAE latent-space ablation for the same 256x256 image resolution and 16x16 image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-B/1 \
 --proj_dropout 0.0 \
 --P_mean -0.8 --P_std 0.8 \
 --img_size 256 --noise_scale 1.0 \
@@ -83,6 +113,23 @@ main_jit.py \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
 
+Token-matched Flux2 VAE latent-space ablation for the same 512x512 image resolution and 16x16 image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-B/2 \
+--proj_dropout 0.0 \
+--P_mean -0.8 --P_std 0.8 \
+--img_size 512 --noise_scale 1.0 \
+--batch_size 128 --blr 5e-5 \
+--epochs 600 --warmup_epochs 5 \
+--gen_bsz 128 --num_images 50000 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--data_path ${IMAGENET_PATH} --online_eval
+```
+
 Example script for training JiT-H/16 on ImageNet 256x256 for 600 epochs:
 ```
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
@@ -97,6 +144,39 @@ main_jit.py \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
 --data_path ${IMAGENET_PATH} --online_eval
 ```
+
+Token-matched Flux2 VAE latent-space ablation for the same 256x256 image resolution and 16x16 image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-H/1 \
+--proj_dropout 0.2 \
+--P_mean -0.8 --P_std 0.8 \
+--img_size 256 --noise_scale 1.0 \
+--batch_size 128 --blr 5e-5 \
+--epochs 600 --warmup_epochs 5 \
+--gen_bsz 128 --num_images 50000 --cfg 2.2 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
+--data_path ${IMAGENET_PATH} --online_eval
+```
+
+### Flux2 VAE latent-space details
+
+JiT can also train in the same Flux2 VAE latent space used by the Diffusers `Flux2KleinPipeline` instead of directly
+denoising RGB pixels. Diffusers encodes images as:
+
+1. normalize image pixels to `[-1, 1]`;
+2. run `AutoencoderKLFlux2.encode(image).latent_dist.mode()` by default;
+3. reshape the 32-channel VAE latent into Flux2/Klein `2x2` latent patches, producing 128 channels;
+4. normalize those patchified latents with `vae.bn.running_mean` and `sqrt(vae.bn.running_var + eps)`.
+
+Decoding performs the exact inverse BN denormalization and unpatchify before `vae.decode(...)`.
+
+The default `--flux2_vae_sample_mode argmax` matches the Flux2/Klein image-conditioning path. Generated samples are
+decoded back to pixel images before saving and FID/IS evaluation. Pixel-space checkpoints and Flux2 VAE latent-space
+checkpoints are not interchangeable; use the matching evaluation command for the data space used during training.
 
 ### Evaluation
 
@@ -113,6 +193,34 @@ main_jit.py \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
+Evaluate a token-matched Flux2 VAE latent-space JiT-B/1 checkpoint at 256x256, matching the `JiT-B/16` 16x16
+image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-B/1 \
+--img_size 256 --noise_scale 1.0 \
+--gen_bsz 256 --num_images 50000 --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--data_path ${IMAGENET_PATH} --evaluate_gen
+```
+
+Evaluate a token-matched Flux2 VAE latent-space JiT-B/2 checkpoint at 512x512, matching the `JiT-B/32` 16x16
+image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-B/2 \
+--img_size 512 --noise_scale 1.0 \
+--gen_bsz 256 --num_images 50000 --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--data_path ${IMAGENET_PATH} --evaluate_gen
+```
+
 Evaluate pre-trained JiT-L:
 ```
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
@@ -124,6 +232,34 @@ main_jit.py \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
 
+Evaluate a token-matched Flux2 VAE latent-space JiT-L/1 checkpoint at 256x256, matching the `JiT-L/16` 16x16
+image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-L/1 \
+--img_size 256 --noise_scale 1.0 \
+--gen_bsz 256 --num_images 50000 --cfg 2.4 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--data_path ${IMAGENET_PATH} --evaluate_gen
+```
+
+Evaluate a token-matched Flux2 VAE latent-space JiT-L/2 checkpoint at 512x512, matching the `JiT-L/32` 16x16
+image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-L/2 \
+--img_size 512 --noise_scale 1.0 \
+--gen_bsz 256 --num_images 50000 --cfg 2.5 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--data_path ${IMAGENET_PATH} --evaluate_gen
+```
+
 Evaluate pre-trained JiT-H:
 ```
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
@@ -131,6 +267,34 @@ main_jit.py \
 --model JiT-H/16 (or JiT-H/32) \
 --img_size 256 (or 512) --noise_scale 1.0 (or 2.0) \
 --gen_bsz 256 --num_images 50000 --cfg 2.2 (or 2.3) --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--data_path ${IMAGENET_PATH} --evaluate_gen
+```
+
+Evaluate a token-matched Flux2 VAE latent-space JiT-H/1 checkpoint at 256x256, matching the `JiT-H/16` 16x16
+image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-H/1 \
+--img_size 256 --noise_scale 1.0 \
+--gen_bsz 256 --num_images 50000 --cfg 2.2 --interval_min 0.1 --interval_max 1.0 \
+--output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
+--data_path ${IMAGENET_PATH} --evaluate_gen
+```
+
+Evaluate a token-matched Flux2 VAE latent-space JiT-H/2 checkpoint at 512x512, matching the `JiT-H/32` 16x16
+image-token grid:
+```
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+main_jit.py \
+--data_space flux2vae \
+--flux2_vae_path black-forest-labs/FLUX.2-klein-base-9B --flux2_vae_subfolder vae \
+--model JiT-H/2 \
+--img_size 512 --noise_scale 1.0 \
+--gen_bsz 256 --num_images 50000 --cfg 2.3 --interval_min 0.1 --interval_max 1.0 \
 --output_dir ${CKPT_DIR} --resume ${CKPT_DIR} \
 --data_path ${IMAGENET_PATH} --evaluate_gen
 ```
