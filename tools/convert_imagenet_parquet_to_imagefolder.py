@@ -9,6 +9,12 @@ the parquet shards into:
     output_dir/train/n01440764/*.jpg
     output_dir/train/n01443537/*.jpg
     ...
+
+When the parquet directory contains files from multiple splits
+(e.g. train-00000-of-00142.parquet, validation-00000-of-00014.parquet,
+test-00000-of-00014.parquet), use --auto_split to automatically detect the
+split name from each file's name prefix and write to the corresponding
+output subdirectory.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import io
 import os
 import shutil
 import sys
+import re
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +78,25 @@ def parse_args() -> argparse.Namespace:
         "--output_split",
         default="train",
         help="Output split directory name under output_dir.",
+    )
+    parser.add_argument(
+        "--auto_split",
+        action="store_true",
+        help=(
+            "Automatically detect the split name from each parquet file's "
+            "name prefix (e.g. 'train-...', 'validation-...', 'test-...') "
+            "and write to the corresponding output subdirectory. "
+            "When set, --output_split is ignored."
+        ),
+    )
+    parser.add_argument(
+        "--split_prefixes",
+        default="train,validation,val,test",
+        help=(
+            "Comma-separated list of known split prefixes to recognize in "
+            "parquet filenames when --auto_split is used. "
+            "Default: 'train,validation,val,test'."
+        ),
     )
     parser.add_argument(
         "--parquet_glob",
@@ -395,6 +421,27 @@ def save_image(
     return "written"
 
 
+def detect_split_from_filename(parquet_file: Path, known_prefixes: list[str]) -> str | None:
+    """Try to extract a split name from a parquet file's name.
+
+    Recognized patterns:
+      - <split>-<shard_info>.parquet  →  <split>
+        e.g. "train-00000-of-00142.parquet" → "train"
+        e.g. "validation-00000-of-00014.parquet" → "validation"
+    """
+    stem = parquet_file.stem  # filename without .parquet
+    # Match known prefix followed by a separator like '-' or '_'
+    for prefix in known_prefixes:
+        # e.g. "train-00000-..." matches prefix "train"
+        pattern = rf"^{re.escape(prefix)}[-_]"
+        if re.match(pattern, stem):
+            return prefix
+    # Also try the full stem if it is exactly a known prefix
+    if stem in known_prefixes:
+        return stem
+    return None
+
+
 def convert(args: argparse.Namespace) -> None:
     try:
         import pyarrow.parquet as pq
@@ -403,87 +450,137 @@ def convert(args: argparse.Namespace) -> None:
 
     parquet_dir = args.parquet_dir.resolve()
     output_dir = args.output_dir.resolve()
-    split_dir = output_dir / args.output_split
     classes_py = args.classes_py.resolve()
 
     synsets = load_synsets(classes_py, args.class_order)
     parquet_files = discover_parquet_files(parquet_dir, args.parquet_glob, not args.no_recursive)
-    prepare_output(split_dir, synsets, args.overwrite, args.resume)
 
-    print(f"Loaded {len(synsets)} classes from {classes_py}")
-    print(f"Found {len(parquet_files)} parquet files under {parquet_dir}")
-    print(f"Writing ImageFolder split to {split_dir}")
-    print("First parquet files:")
-    for path in parquet_files[:5]:
-        print(f"  {path}")
-    if len(parquet_files) > 5:
-        print("  ...")
+    auto_split = args.auto_split
+    known_prefixes = [p.strip() for p in args.split_prefixes.split(",") if p.strip()]
 
-    written = 0
-    existing = 0
-    skipped_invalid = 0
-    skipped_bad = 0
-    seen_valid = 0
+    # When auto_split is enabled, group parquet files by detected split name.
+    if auto_split:
+        split_groups: dict[str, list[Path]] = {}
+        unassigned: list[Path] = []
+        for pf in parquet_files:
+            split_name = detect_split_from_filename(pf, known_prefixes)
+            if split_name is not None:
+                split_groups.setdefault(split_name, []).append(pf)
+            else:
+                unassigned.append(pf)
+        if unassigned:
+            names = ", ".join(str(p.name) for p in unassigned)
+            raise ValueError(
+                f"--auto_split could not detect split from filenames: {names}. "
+                "Either rename files to follow '<split>-<shard>.parquet' convention, "
+                "or use --parquet_glob and --output_split manually."
+            )
+        print(f"Auto-detected splits: {', '.join(f'{k} ({len(v)} files)' for k, v in split_groups.items())}")
+    else:
+        # Single-split mode: all files go to args.output_split
+        split_groups = {args.output_split: parquet_files}
 
-    for file_index, parquet_file in enumerate(parquet_files):
-        print(f"[{file_index + 1}/{len(parquet_files)}] {parquet_file}")
-        parquet = pq.ParquetFile(parquet_file)
-        schema_names = set(parquet.schema_arrow.names)
-        missing = [name for name in (args.image_column, args.label_column) if name not in schema_names]
-        if missing:
-            raise KeyError(f"{parquet_file} is missing required columns: {missing}")
+    total_written = 0
+    total_existing = 0
+    total_skipped_invalid = 0
+    total_skipped_bad = 0
 
-        row_offset = 0
-        for batch in parquet.iter_batches(
-            batch_size=args.batch_size,
-            columns=[args.image_column, args.label_column],
-        ):
-            image_column = batch.column(batch.schema.get_field_index(args.image_column)).to_pylist()
-            label_column = batch.column(batch.schema.get_field_index(args.label_column)).to_pylist()
+    for split_name, split_parquet_files in split_groups.items():
+        split_dir = output_dir / split_name
+        prepare_output(split_dir, synsets, args.overwrite, args.resume)
 
-            for offset, (image_value, label_value) in enumerate(zip(image_column, label_column)):
-                row_index = row_offset + offset
-                label = int(label_value)
-                if label < 0 or label >= len(synsets):
-                    if args.skip_invalid_labels:
-                        skipped_invalid += 1
+        print(f"\n{'=' * 60}")
+        print(f"Split: {split_name}  ({len(split_parquet_files)} parquet files)")
+        print(f"Output: {split_dir}")
+        print(f"{'=' * 60}")
+        print(f"First parquet files:")
+        for path in split_parquet_files[:5]:
+            print(f"  {path}")
+        if len(split_parquet_files) > 5:
+            print("  ...")
+
+        written = 0
+        existing = 0
+        skipped_invalid = 0
+        skipped_bad = 0
+        seen_valid = 0
+
+        for file_index, parquet_file in enumerate(split_parquet_files):
+            print(f"[{file_index + 1}/{len(split_parquet_files)}] {parquet_file}")
+            parquet = pq.ParquetFile(parquet_file)
+            schema_names = set(parquet.schema_arrow.names)
+            missing = [name for name in (args.image_column, args.label_column) if name not in schema_names]
+            if missing:
+                raise KeyError(f"{parquet_file} is missing required columns: {missing}")
+
+            row_offset = 0
+            for batch in parquet.iter_batches(
+                batch_size=args.batch_size,
+                columns=[args.image_column, args.label_column],
+            ):
+                image_column = batch.column(batch.schema.get_field_index(args.image_column)).to_pylist()
+                label_column = batch.column(batch.schema.get_field_index(args.label_column)).to_pylist()
+
+                for offset, (image_value, label_value) in enumerate(zip(image_column, label_column)):
+                    row_index = row_offset + offset
+                    label = int(label_value)
+                    if label < 0 or label >= len(synsets):
+                        if args.skip_invalid_labels:
+                            skipped_invalid += 1
+                            continue
+                        raise ValueError(
+                            f"Invalid label {label} in {parquet_file} row {row_index}. "
+                            "If this is a test split with label=-1, pass only train shards "
+                            "or add --skip_invalid_labels intentionally."
+                        )
+
+                    synset = synsets[label]
+                    destination_base = split_dir / synset / f"{file_index:05d}-{row_index:08d}"
+                    try:
+                        result = save_image(image_value, destination_base, parquet_file, parquet_dir, args)
+                    except Exception:
+                        if not args.skip_bad_images:
+                            raise
+                        skipped_bad += 1
                         continue
-                    raise ValueError(
-                        f"Invalid label {label} in {parquet_file} row {row_index}. "
-                        "If this is a test split with label=-1, pass only train shards "
-                        "or add --skip_invalid_labels intentionally."
-                    )
 
-                synset = synsets[label]
-                destination_base = split_dir / synset / f"{file_index:05d}-{row_index:08d}"
-                try:
-                    result = save_image(image_value, destination_base, parquet_file, parquet_dir, args)
-                except Exception:
-                    if not args.skip_bad_images:
-                        raise
-                    skipped_bad += 1
-                    continue
+                    if result == "existing":
+                        existing += 1
+                    else:
+                        written += 1
+                    seen_valid += 1
 
-                if result == "existing":
-                    existing += 1
-                else:
-                    written += 1
-                seen_valid += 1
+                    if args.print_every > 0 and seen_valid % args.print_every == 0:
+                        print(
+                            f"  valid={seen_valid} written={written} existing={existing} "
+                            f"skipped_invalid={skipped_invalid} skipped_bad={skipped_bad}"
+                        )
 
-                if args.print_every > 0 and seen_valid % args.print_every == 0:
-                    print(
-                        f"  valid={seen_valid} written={written} existing={existing} "
-                        f"skipped_invalid={skipped_invalid} skipped_bad={skipped_bad}"
-                    )
+                    if args.limit is not None and seen_valid >= args.limit:
+                        print("Reached --limit; stopping early.")
+                        print_summary(written, existing, skipped_invalid, skipped_bad, split_dir)
+                        total_written += written
+                        total_existing += existing
+                        total_skipped_invalid += skipped_invalid
+                        total_skipped_bad += skipped_bad
+                        return
 
-                if args.limit is not None and seen_valid >= args.limit:
-                    print("Reached --limit; stopping early.")
-                    print_summary(written, existing, skipped_invalid, skipped_bad, split_dir)
-                    return
+                row_offset += batch.num_rows
 
-            row_offset += batch.num_rows
+        print_summary(written, existing, skipped_invalid, skipped_bad, split_dir)
+        total_written += written
+        total_existing += existing
+        total_skipped_invalid += skipped_invalid
+        total_skipped_bad += skipped_bad
 
-    print_summary(written, existing, skipped_invalid, skipped_bad, split_dir)
+    if auto_split and len(split_groups) > 1:
+        print(f"\n{'=' * 60}")
+        print("Overall summary across all splits:")
+        print(f"  total_written: {total_written}")
+        print(f"  total_existing: {total_existing}")
+        print(f"  total_skipped_invalid_labels: {total_skipped_invalid}")
+        print(f"  total_skipped_bad_images: {total_skipped_bad}")
+        print(f"  splits: {', '.join(split_groups.keys())}")
 
 
 def print_summary(written: int, existing: int, skipped_invalid: int, skipped_bad: int, split_dir: Path) -> None:
