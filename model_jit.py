@@ -542,7 +542,9 @@ class JiTHRM(nn.Module):
 
     def _hrm_step(self, z_H, z_L, input_embeddings, c):
         for H_step in range(self.H_cycles):
-            for _L_step in range(self.L_cycles):
+            for L_step in range(self.L_cycles):
+                if (H_step == self.H_cycles - 1) and (L_step == self.L_cycles - 1):
+                    continue
                 z_L = self.L_level(z_L, z_H + input_embeddings, c=c, feat_rope=self.feat_rope)
             if H_step != self.H_cycles - 1:
                 z_H = self.H_level(z_H, z_L, c=c, feat_rope=self.feat_rope)
