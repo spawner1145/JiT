@@ -223,6 +223,7 @@ class JiTHRMBlock(nn.Module):
                 nn.Linear(hidden_size, 6 * hidden_size, bias=True)
             )
 
+    @torch.compile
     def forward(self, x, c=None, feat_rope=None):
         if self.use_adaln:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
