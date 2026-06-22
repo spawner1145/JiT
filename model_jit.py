@@ -94,7 +94,7 @@ class LabelEmbedder(nn.Module):
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
+    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype, device=query.device)
 
     with torch.cuda.amp.autocast(enabled=False):
         attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
@@ -200,6 +200,57 @@ class JiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
+
+
+class JiTHRMBlock(nn.Module):
+    """
+    HRM-style post-norm Transformer block.
+
+    Unlike JiTBlock, conditioning is supplied by the recurrent input injection
+    rather than AdaLN gates, matching the HRM paper more closely.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, use_adaln=False):
+        super().__init__()
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=False, qk_norm=False,
+                              attn_drop=attn_drop, proj_drop=proj_drop)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, bias=False)
+        self.norm_eps = 1e-6
+        self.use_adaln = use_adaln
+        if use_adaln:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            )
+
+    def forward(self, x, c=None, feat_rope=None):
+        if self.use_adaln:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+            attn_in = modulate(F.rms_norm(x, (x.shape[-1],), eps=self.norm_eps), shift_msa, scale_msa)
+            x = F.rms_norm(x + gate_msa.unsqueeze(1) * self.attn(attn_in, rope=feat_rope), (x.shape[-1],), eps=self.norm_eps)
+            mlp_in = modulate(F.rms_norm(x, (x.shape[-1],), eps=self.norm_eps), shift_mlp, scale_mlp)
+            x = F.rms_norm(x + gate_mlp.unsqueeze(1) * self.mlp(mlp_in), (x.shape[-1],), eps=self.norm_eps)
+            return x
+
+        x = F.rms_norm(x + self.attn(x, rope=feat_rope), (x.shape[-1],), eps=self.norm_eps)
+        x = F.rms_norm(x + self.mlp(x), (x.shape[-1],), eps=self.norm_eps)
+        return x
+
+
+class JiTHRMReasoningModule(nn.Module):
+    def __init__(self, hidden_size, num_heads, depth, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, use_adaln=False):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            JiTHRMBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                        attn_drop=attn_drop, proj_drop=proj_drop, use_adaln=use_adaln)
+            for _ in range(depth)
+        ])
+
+    def forward(self, hidden_states, input_injection, c=None, feat_rope=None):
+        hidden_states = hidden_states + input_injection
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, c=c, feat_rope=feat_rope)
+        return hidden_states
 
 
 class JiT(nn.Module):
@@ -359,6 +410,180 @@ class JiT(nn.Module):
         return output
 
 
+class JiTHRM(nn.Module):
+    """
+    HRM-inspired JiT backbone for continuous image/latent denoising.
+
+    It keeps JiT's patch I/O and diffusion conditioning, while replacing the
+    feed-forward block stack with HRM's hierarchical recurrent H/L modules.
+    """
+    def __init__(
+        self,
+        input_size=256,
+        patch_size=16,
+        in_channels=3,
+        hidden_size=768,
+        H_layers=4,
+        L_layers=4,
+        H_cycles=2,
+        L_cycles=2,
+        num_heads=12,
+        mlp_ratio=4.0,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        num_classes=1000,
+        bottleneck_dim=128,
+        one_step_grad=True,
+        use_adaln=False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.num_classes = num_classes
+        self.H_cycles = H_cycles
+        self.L_cycles = L_cycles
+        self.one_step_grad = one_step_grad
+        self.use_adaln = use_adaln
+
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
+        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+
+        num_patches = self.x_embedder.num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        half_head_dim = hidden_size // num_heads // 2
+        hw_seq_len = input_size // patch_size
+        self.feat_rope = VisionRotaryEmbeddingFast(
+            dim=half_head_dim,
+            pt_seq_len=hw_seq_len,
+            num_cls_token=0
+        )
+
+        self.H_level = JiTHRMReasoningModule(
+            hidden_size, num_heads, H_layers, mlp_ratio=mlp_ratio,
+            attn_drop=attn_drop, proj_drop=proj_drop, use_adaln=use_adaln
+        )
+        self.L_level = JiTHRMReasoningModule(
+            hidden_size, num_heads, L_layers, mlp_ratio=mlp_ratio,
+            attn_drop=attn_drop, proj_drop=proj_drop, use_adaln=use_adaln
+        )
+
+        self.register_buffer("H_init", torch.empty(hidden_size), persistent=True)
+        self.register_buffer("L_init", torch.empty(hidden_size), persistent=True)
+
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        w1 = self.x_embedder.proj1.weight.data
+        nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
+        w2 = self.x_embedder.proj2.weight.data
+        nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj2.bias, 0)
+
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        nn.init.trunc_normal_(self.H_init, std=1.0, a=-2.0, b=2.0)
+        nn.init.trunc_normal_(self.L_init, std=1.0, a=-2.0, b=2.0)
+
+        if self.use_adaln:
+            for module in list(self.H_level.layers) + list(self.L_level.layers):
+                nn.init.constant_(module.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(module.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def unpatchify(self, x, p):
+        c = self.out_channels
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
+    def _initial_states(self, x):
+        bsz, seq_len, _ = x.shape
+        z_H = self.H_init.to(dtype=x.dtype).view(1, 1, -1).expand(bsz, seq_len, -1)
+        z_L = self.L_init.to(dtype=x.dtype).view(1, 1, -1).expand(bsz, seq_len, -1)
+        return z_H, z_L
+
+    def _conditioned_input(self, x, t, y):
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y)
+        c = t_emb + y_emb
+
+        x = self.x_embedder(x)
+        input_embeddings = x + self.pos_embed + c.unsqueeze(1)
+        return input_embeddings, c
+
+    def _hrm_step(self, z_H, z_L, input_embeddings, c):
+        for H_step in range(self.H_cycles):
+            for _L_step in range(self.L_cycles):
+                z_L = self.L_level(z_L, z_H + input_embeddings, c=c, feat_rope=self.feat_rope)
+            if H_step != self.H_cycles - 1:
+                z_H = self.H_level(z_H, z_L, c=c, feat_rope=self.feat_rope)
+        return z_H, z_L
+
+    def _one_step_grad(self, z_H, z_L, input_embeddings, c):
+        z_L = self.L_level(z_L, z_H + input_embeddings, c=c, feat_rope=self.feat_rope)
+        z_H = self.H_level(z_H, z_L, c=c, feat_rope=self.feat_rope)
+        return z_H, z_L
+
+    def _forward_from_states(self, input_embeddings, c, z_H, z_L):
+        if self.one_step_grad:
+            with torch.no_grad():
+                z_H, z_L = self._hrm_step(z_H, z_L, input_embeddings, c)
+            z_H, z_L = self._one_step_grad(z_H, z_L, input_embeddings, c)
+        else:
+            z_H, z_L = self._hrm_step(z_H, z_L, input_embeddings, c)
+            z_H = self.H_level(z_H, z_L, c=c, feat_rope=self.feat_rope)
+
+        x = self.final_layer(z_H, c)
+        output = self.unpatchify(x, self.patch_size)
+        return output, z_H, z_L
+
+    def forward(self, x, t, y):
+        input_embeddings, c = self._conditioned_input(x, t, y)
+        z_H, z_L = self._initial_states(input_embeddings)
+        output, _, _ = self._forward_from_states(input_embeddings, c, z_H, z_L)
+        return output
+
+    def forward_segments(self, x, t, y, segments=2):
+        input_embeddings, c = self._conditioned_input(x, t, y)
+        z_H, z_L = self._initial_states(input_embeddings)
+
+        outputs = []
+        for _ in range(segments):
+            output, z_H, z_L = self._forward_from_states(input_embeddings, c, z_H, z_L)
+            outputs.append(output)
+            z_H = z_H.detach()
+            z_L = z_L.detach()
+        return outputs
+
+
 def JiT_B_16(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
                bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16, **kwargs)
@@ -384,6 +609,31 @@ def JiT_H_32(**kwargs):
                bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32, **kwargs)
 
 
+def JiT_HRM_B_16(**kwargs):
+    return JiTHRM(H_layers=4, L_layers=4, H_cycles=2, L_cycles=2,
+                  hidden_size=768, num_heads=12, bottleneck_dim=128, patch_size=16, **kwargs)
+
+def JiT_HRM_B_32(**kwargs):
+    return JiTHRM(H_layers=4, L_layers=4, H_cycles=2, L_cycles=2,
+                  hidden_size=768, num_heads=12, bottleneck_dim=128, patch_size=32, **kwargs)
+
+def JiT_HRM_L_16(**kwargs):
+    return JiTHRM(H_layers=6, L_layers=6, H_cycles=2, L_cycles=2,
+                  hidden_size=1024, num_heads=16, bottleneck_dim=128, patch_size=16, **kwargs)
+
+def JiT_HRM_L_32(**kwargs):
+    return JiTHRM(H_layers=6, L_layers=6, H_cycles=2, L_cycles=2,
+                  hidden_size=1024, num_heads=16, bottleneck_dim=128, patch_size=32, **kwargs)
+
+def JiT_HRM_H_16(**kwargs):
+    return JiTHRM(H_layers=8, L_layers=8, H_cycles=2, L_cycles=2,
+                  hidden_size=1280, num_heads=16, bottleneck_dim=256, patch_size=16, **kwargs)
+
+def JiT_HRM_H_32(**kwargs):
+    return JiTHRM(H_layers=8, L_layers=8, H_cycles=2, L_cycles=2,
+                  hidden_size=1280, num_heads=16, bottleneck_dim=256, patch_size=32, **kwargs)
+
+
 _JIT_ARCH_CONFIGS = {
     'B': dict(depth=12, hidden_size=768, num_heads=12,
               bottleneck_dim=128, in_context_len=32, in_context_start=4),
@@ -394,9 +644,47 @@ _JIT_ARCH_CONFIGS = {
 }
 
 
+_JIT_HRM_ARCH_CONFIGS = {
+    'B': dict(H_layers=4, L_layers=4, H_cycles=2, L_cycles=2,
+              hidden_size=768, num_heads=12, bottleneck_dim=128),
+    'L': dict(H_layers=6, L_layers=6, H_cycles=2, L_cycles=2,
+              hidden_size=1024, num_heads=16, bottleneck_dim=128),
+    'H': dict(H_layers=8, L_layers=8, H_cycles=2, L_cycles=2,
+              hidden_size=1280, num_heads=16, bottleneck_dim=256),
+}
+
+
 def create_jit_model(name, **kwargs):
     if name in JiT_models:
         return JiT_models[name](**kwargs)
+
+    if name.startswith('JiT-HRM-'):
+        try:
+            arch_name, patch_size = name.removeprefix('JiT-HRM-').split('/')
+            patch_size = int(patch_size)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unknown JiT-HRM model '{name}'. Expected names like 'JiT-HRM-B/16' or 'JiT-HRM-B/1'."
+            ) from exc
+
+        variant_kwargs = {}
+        variant_suffixes = {
+            '-FullGrad': dict(one_step_grad=False),
+            '-AdaLN': dict(use_adaln=True),
+            '-AdaLNFullGrad': dict(use_adaln=True, one_step_grad=False),
+        }
+        for suffix, suffix_kwargs in variant_suffixes.items():
+            if arch_name.endswith(suffix):
+                arch_name = arch_name.removesuffix(suffix)
+                variant_kwargs.update(suffix_kwargs)
+                break
+
+        if arch_name not in _JIT_HRM_ARCH_CONFIGS:
+            raise ValueError(f"Unknown JiT-HRM architecture '{arch_name}'. Expected one of {sorted(_JIT_HRM_ARCH_CONFIGS)}.")
+        if patch_size <= 0:
+            raise ValueError(f"Patch size must be positive, got {patch_size}.")
+
+        return JiTHRM(patch_size=patch_size, **_JIT_HRM_ARCH_CONFIGS[arch_name], **variant_kwargs, **kwargs)
 
     try:
         arch_name, patch_size = name.removeprefix('JiT-').split('/')
@@ -421,4 +709,10 @@ JiT_models = {
     'JiT-L/32': JiT_L_32,
     'JiT-H/16': JiT_H_16,
     'JiT-H/32': JiT_H_32,
+    'JiT-HRM-B/16': JiT_HRM_B_16,
+    'JiT-HRM-B/32': JiT_HRM_B_32,
+    'JiT-HRM-L/16': JiT_HRM_L_16,
+    'JiT-HRM-L/32': JiT_HRM_L_32,
+    'JiT-HRM-H/16': JiT_HRM_H_16,
+    'JiT-HRM-H/32': JiT_HRM_H_32,
 }
