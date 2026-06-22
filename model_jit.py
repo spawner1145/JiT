@@ -203,12 +203,6 @@ class JiTBlock(nn.Module):
 
 
 class JiTHRMBlock(nn.Module):
-    """
-    HRM-style post-norm Transformer block.
-
-    Unlike JiTBlock, conditioning is supplied by the recurrent input injection
-    rather than AdaLN gates, matching the HRM paper more closely.
-    """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, use_adaln=False):
         super().__init__()
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=False, qk_norm=False,
@@ -412,12 +406,6 @@ class JiT(nn.Module):
 
 
 class JiTHRM(nn.Module):
-    """
-    HRM-inspired JiT backbone for continuous image/latent denoising.
-
-    It keeps JiT's patch I/O and diffusion conditioning, while replacing the
-    feed-forward block stack with HRM's hierarchical recurrent H/L modules.
-    """
     def __init__(
         self,
         input_size=256,
