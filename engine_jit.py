@@ -2,6 +2,7 @@ import math
 import sys
 import os
 import shutil
+from contextlib import nullcontext
 
 import torch
 import numpy as np
@@ -9,8 +10,12 @@ import cv2
 
 import util.misc as misc
 import util.lr_sched as lr_sched
-import torch_fidelity
 import copy
+
+try:
+    import torch_fidelity
+except ImportError:
+    torch_fidelity = None
 
 
 def get_grad_norm(parameters):
@@ -37,9 +42,18 @@ def train_one_epoch(
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
+    accum_iter = max(1, getattr(args, "accum_iter", 1))
+    num_batches = len(data_loader)
+    remainder = num_batches % accum_iter
+    final_partial_start = num_batches - remainder if remainder != 0 else num_batches
+
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        is_update_step = ((data_iter_step + 1) % accum_iter == 0) or (data_iter_step + 1 == num_batches)
+        accum_this_step = remainder if data_iter_step >= final_partial_start else accum_iter
+
         # per iteration (instead of per epoch) lr scheduler
-        lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+        if data_iter_step % accum_iter == 0:
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / num_batches + epoch, args)
 
         # normalize image to [-1, 1]
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
@@ -48,7 +62,11 @@ def train_one_epoch(
             x = data_space.encode(x)
         labels = labels.to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        sync_context = nullcontext()
+        if hasattr(model, "no_sync") and not is_update_step:
+            sync_context = model.no_sync()
+
+        with sync_context, torch.amp.autocast('cuda', dtype=torch.bfloat16):
             loss = model(x, labels)
 
         loss_value = loss.item()
@@ -56,24 +74,32 @@ def train_one_epoch(
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
-        optimizer.zero_grad()
+        loss = loss / accum_this_step
         loss.backward()
-        grad_norm_pre_clip = get_grad_norm(model.parameters())
+
+        grad_norm_pre_clip = torch.tensor(0.0, device=device)
         grad_norm_post_clip = grad_norm_pre_clip
-        grad_clip_ratio = torch.tensor(0.0, device=grad_norm_pre_clip.device)
-        if args.grad_clip is not None and args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            grad_norm_post_clip = get_grad_norm(model.parameters())
-            grad_clip_ratio = grad_norm_pre_clip / args.grad_clip
-        optimizer.step()
+        grad_clip_ratio = torch.tensor(0.0, device=device)
+        if is_update_step:
+            grad_norm_pre_clip = get_grad_norm(model.parameters())
+            grad_norm_post_clip = grad_norm_pre_clip
+            if args.grad_clip is not None and args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                grad_norm_post_clip = get_grad_norm(model.parameters())
+                grad_clip_ratio = grad_norm_pre_clip / args.grad_clip
+            optimizer.step()
+            optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+            model_without_ddp.update_ema()
 
-        model_without_ddp.update_ema()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
-        metric_logger.update(grad_norm=grad_norm_pre_clip.item())
-        metric_logger.update(grad_norm_post_clip=grad_norm_post_clip.item())
+        if is_update_step:
+            metric_logger.update(grad_norm=grad_norm_pre_clip.item())
+            metric_logger.update(grad_norm_post_clip=grad_norm_post_clip.item())
+            metric_logger.update(grad_clip_ratio=grad_clip_ratio.item())
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
@@ -85,21 +111,25 @@ def train_one_epoch(
             if log_writer is not None:
                 log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
                 log_writer.add_scalar('lr', lr, epoch_1000x)
-                log_writer.add_scalar('grad_norm', grad_norm_pre_clip.item(), epoch_1000x)
-                log_writer.add_scalar('grad_norm_pre_clip', grad_norm_pre_clip.item(), epoch_1000x)
-                log_writer.add_scalar('grad_norm_post_clip', grad_norm_post_clip.item(), epoch_1000x)
-                log_writer.add_scalar('grad_clip_ratio', grad_clip_ratio.item(), epoch_1000x)
+                if is_update_step:
+                    log_writer.add_scalar('grad_norm', grad_norm_pre_clip.item(), epoch_1000x)
+                    log_writer.add_scalar('grad_norm_pre_clip', grad_norm_pre_clip.item(), epoch_1000x)
+                    log_writer.add_scalar('grad_norm_post_clip', grad_norm_post_clip.item(), epoch_1000x)
+                    log_writer.add_scalar('grad_clip_ratio', grad_clip_ratio.item(), epoch_1000x)
 
             if wandb_run is not None:
                 log_data = {
                     "train/loss": loss_value_reduce,
                     "train/lr": lr,
                     "train/epoch": data_iter_step / len(data_loader) + epoch,
-                    "train/grad_norm": grad_norm_pre_clip.item(),
-                    "train/grad_norm_pre_clip": grad_norm_pre_clip.item(),
-                    "train/grad_norm_post_clip": grad_norm_post_clip.item(),
-                    "train/grad_clip_ratio": grad_clip_ratio.item(),
                 }
+                if is_update_step:
+                    log_data.update({
+                        "train/grad_norm": grad_norm_pre_clip.item(),
+                        "train/grad_norm_pre_clip": grad_norm_pre_clip.item(),
+                        "train/grad_norm_post_clip": grad_norm_post_clip.item(),
+                        "train/grad_clip_ratio": grad_clip_ratio.item(),
+                    })
                 wandb_run.log(log_data, step=epoch_1000x)
 
 
@@ -174,6 +204,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, wan
 
     # compute FID and IS
     if log_writer is not None or wandb_run is not None:
+        if torch_fidelity is None:
+            raise ImportError("Install torch_fidelity to run online generation evaluation.")
         if args.img_size == 256:
             fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
         elif args.img_size == 512:

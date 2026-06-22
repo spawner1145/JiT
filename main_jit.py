@@ -37,6 +37,8 @@ def get_args_parser():
                         help='Epochs to warm up LR')
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
+    parser.add_argument('--accum_iter', default=1, type=int,
+                        help='Accumulate gradients over this many iterations')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='Learning rate (absolute)')
     parser.add_argument('--blr', type=float, default=5e-5, metavar='LR',
@@ -216,12 +218,14 @@ def main(args):
 
     model.to(device)
 
-    eff_batch_size = args.batch_size * misc.get_world_size()
+    eff_batch_size = args.batch_size * misc.get_world_size() * args.accum_iter
     if args.lr is None:  # only base_lr (blr) is specified
         args.lr = args.blr * eff_batch_size / 256
 
     print("Base lr: {:.2e}".format(args.lr * 256 / eff_batch_size))
     print("Actual lr: {:.2e}".format(args.lr))
+    print("Micro batch size: %d" % args.batch_size)
+    print("Gradient accumulation steps: %d" % args.accum_iter)
     print("Effective batch size: %d" % eff_batch_size)
 
     wandb_run = None
